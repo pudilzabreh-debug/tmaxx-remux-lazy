@@ -191,8 +191,43 @@ pub async fn bind_and_serve(router: Router, port: u16) -> Result<()> {
     let app = MapRequestLayer::new(rewrite_request_uri).layer(router);
     info!("starting webserver at {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
+        let mut interrupt =
+            signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+
+        tokio::select! {
+            _ = terminate.recv() => {
+                info!("received SIGTERM, shutting down");
+            }
+            _ = interrupt.recv() => {
+                info!("received SIGINT, shutting down");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(?err, "failed to listen for shutdown signal");
+        } else {
+            info!("received shutdown signal, shutting down");
+        }
+    }
 }
 
 #[cfg(unix)]
