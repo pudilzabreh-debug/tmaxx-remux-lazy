@@ -184,7 +184,12 @@ where
         // this or it silently targets a row that was never written.
         let id_remap = match ctx
             .addons
-            .process_meta_batch(new_items.clone(), ctx, true, None)
+            .process_meta_batch_root_only_series(
+                new_items.clone(),
+                ctx,
+                true,
+                None,
+            )
             .await
         {
             Ok(map) => map,

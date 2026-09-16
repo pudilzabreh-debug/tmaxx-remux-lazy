@@ -204,7 +204,12 @@ impl Task for RefreshLibraryTask {
                 .map(|m| m.id);
             let batch_start = std::time::Instant::now();
             ctx.addons
-                .process_meta_batch(batch, &ctx, false, None)
+                .process_meta_batch_root_only_series(
+                    batch,
+                    &ctx,
+                    false,
+                    None,
+                )
                 .await?;
             processed += fetched;
             info!(

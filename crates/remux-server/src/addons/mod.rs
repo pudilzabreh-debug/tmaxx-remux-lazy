@@ -2137,6 +2137,44 @@ impl AddonService {
         force_refresh: bool,
         on_item_done: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<HashMap<Uuid, Uuid>> {
+        self.process_meta_batch_with_tree_policy(
+            media,
+            ctx,
+            force_refresh,
+            on_item_done,
+            false,
+        )
+        .await
+    }
+
+    /// Process top-level metadata normally, but deliberately skip Series tree
+    /// expansion. Used by catalog/library background refresh so large TV
+    /// catalogs do not eagerly materialize every season and episode.
+    pub async fn process_meta_batch_root_only_series(
+        &self,
+        media: Vec<db::Media>,
+        ctx: &AppContext,
+        force_refresh: bool,
+        on_item_done: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<HashMap<Uuid, Uuid>> {
+        self.process_meta_batch_with_tree_policy(
+            media,
+            ctx,
+            force_refresh,
+            on_item_done,
+            true,
+        )
+        .await
+    }
+
+    async fn process_meta_batch_with_tree_policy(
+        &self,
+        media: Vec<db::Media>,
+        ctx: &AppContext,
+        force_refresh: bool,
+        on_item_done: Option<Arc<dyn Fn() + Send + Sync>>,
+        root_only_series: bool,
+    ) -> Result<HashMap<Uuid, Uuid>> {
         use futures::StreamExt;
 
         let config = db::Settings::get_config_or_default(&ctx.db).await;
@@ -2171,9 +2209,18 @@ impl AddonService {
                     let cfg = Arc::clone(&config);
                     let sem = Arc::clone(&semaphore);
                     let original_id = m.id;
+                    let expand_tree =
+                        !(root_only_series && m.kind == db::MediaKind::Series);
                     async move {
                         let final_id = svc
-                            .process_meta_item(m, ctx, force_refresh, cfg, sem)
+                            .process_meta_item_with_tree(
+                                m,
+                                ctx,
+                                force_refresh,
+                                cfg,
+                                sem,
+                                expand_tree,
+                            )
                             .await;
                         (original_id, final_id)
                     }
@@ -2294,6 +2341,26 @@ impl AddonService {
         config: Arc<api::ServerConfiguration>,
         semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Uuid {
+        self.process_meta_item_with_tree(
+            media,
+            ctx,
+            force_refresh,
+            config,
+            semaphore,
+            true,
+        )
+        .await
+    }
+
+    async fn process_meta_item_with_tree(
+        &self,
+        media: db::Media,
+        ctx: AppContext,
+        force_refresh: bool,
+        config: Arc<api::ServerConfiguration>,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        expand_tree: bool,
+    ) -> Uuid {
         let title = media
             .title
             .clone();
@@ -2310,7 +2377,14 @@ impl AddonService {
             "top-level metadata item starting"
         );
         let id = self
-            .process_meta_item_inner(media, ctx, force_refresh, config, semaphore)
+            .process_meta_item_inner(
+                media,
+                ctx,
+                force_refresh,
+                config,
+                semaphore,
+                expand_tree,
+            )
             .await;
         trace!(
             target: "remux_server::metadata_refresh",
@@ -2330,6 +2404,7 @@ impl AddonService {
         force_refresh: bool,
         config: Arc<api::ServerConfiguration>,
         semaphore: Arc<tokio::sync::Semaphore>,
+        expand_tree: bool,
     ) -> Uuid {
         use futures::StreamExt;
 
@@ -2502,6 +2577,18 @@ impl AddonService {
         save_pending_relations(&ctx, &[media.clone()]).await;
         save_pending_tags(&ctx, &[media.clone()]).await;
         save_pending_popularity(&ctx, &[media.clone()]).await;
+
+        if !expand_tree {
+            trace!(
+                target: "remux_server::metadata_refresh",
+                id = %actual_root_id,
+                title = %media.title,
+                kind = %media.kind,
+                "tree expansion skipped for root-only metadata refresh"
+            );
+            self.notify_series_done(&media);
+            return actual_root_id;
+        }
 
         let is_continuing = series_is_active(&media.status);
 
