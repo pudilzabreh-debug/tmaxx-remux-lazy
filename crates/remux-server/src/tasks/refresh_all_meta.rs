@@ -56,7 +56,7 @@ impl Task for RefreshAllMetaTask {
             "starting full metadata refresh"
         );
 
-        // Shared counter incremented per item inside process_meta_batch so progress
+        // Shared counter incremented per item inside the metadata batch so progress
         // updates as each concurrent item finishes, not once per full 100-item batch.
         let processed = Arc::new(AtomicUsize::new(0));
         let on_item_done: Arc<dyn Fn() + Send + Sync> = {
@@ -119,7 +119,7 @@ impl Task for RefreshAllMetaTask {
                 .map(|m| m.id);
             let process_started = std::time::Instant::now();
             ctx.addons
-                .process_meta_batch(batch, &ctx, true, Some(Arc::clone(&on_item_done)))
+                .process_meta_batch_root_only_series(batch, &ctx, true, Some(Arc::clone(&on_item_done)))
                 .await?;
             trace!(
                 target: "remux_server::metadata_refresh",

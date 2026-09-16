@@ -1024,7 +1024,7 @@ pub async fn refresh_item(
         state
             .ctx
             .addons
-            .process_meta_batch(vec![media], &state.ctx, force_refresh, None)
+            .process_meta_batch_root_only_series(vec![media], &state.ctx, force_refresh, None)
             .await?;
     }
 

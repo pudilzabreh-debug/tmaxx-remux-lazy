@@ -234,7 +234,7 @@ pub async fn remote_search_apply(
     state
         .ctx
         .addons
-        .process_meta_batch(vec![media], &state.ctx, true, None)
+        .process_meta_batch_root_only_series(vec![media], &state.ctx, true, None)
         .await
         .map_err(|e| e.context_internal("metadata refresh failed"))?;
 
