@@ -1,0 +1,107 @@
+name: T-MAXX ARM64 Compile Gate
+
+on:
+  push:
+    branches:
+      - ci-arm64
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FROZEN_SHA: 691bedd4a1717b3c3bdf68fac8d89b3621172789
+  TARGET: aarch64-unknown-linux-gnu
+
+jobs:
+  compile-arm64:
+    name: Compile remux-server — Linux ARM64
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout frozen T-MAXX source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FROZEN_SHA }}
+          fetch-depth: 1
+
+      - name: Verify frozen commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTUAL="$(git rev-parse HEAD)"
+
+          echo "EXPECTED=${FROZEN_SHA}"
+          echo "ACTUAL=${ACTUAL}"
+
+          test "${ACTUAL}" = "${FROZEN_SHA}"
+
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          uname -a
+          uname -m
+
+          test "$(uname -m)" = "aarch64"
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libssl-dev \
+            file
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tmaxx-remux-arm64-691bedd
+
+      - name: Compile remux-server
+        shell: bash
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+
+          cargo build \
+            --release \
+            --target "${TARGET}" \
+            -p remux-server
+
+      - name: Verify compiled binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="target/${TARGET}/release/remux-server"
+
+          test -x "${BIN}"
+
+          ls -lh "${BIN}"
+          file "${BIN}"
+          sha256sum "${BIN}" | tee remux-server.sha256
+
+          file "${BIN}" | grep -Eq \
+            'ARM aarch64|ARM64|aarch64'
+
+      - name: Upload ARM64 server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmaxx-remux-server-linux-arm64-691bedd
+          path: |
+            target/aarch64-unknown-linux-gnu/release/remux-server
+            remux-server.sha256
+          if-no-files-found: error
+          retention-days: 7
