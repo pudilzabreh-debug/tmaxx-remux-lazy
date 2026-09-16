@@ -2816,6 +2816,353 @@ impl AddonService {
         actual_root_id
     }
 
+    /// Lazily materialize exactly one tree level for Jellyfin show APIs.
+    ///
+    /// Series -> Seasons
+    /// Season -> Episodes
+    ///
+    /// The operation is skipped when the requested direct children are already
+    /// present in SQLite. A per-parent lock prevents two clients from hydrating
+    /// the same node concurrently.
+    pub async fn hydrate_direct_children_for_api(
+        &self,
+        parent: &db::Media,
+        ctx: &AppContext,
+    ) -> Result<usize> {
+        use futures::StreamExt;
+
+        let expected_kind = match &parent.kind {
+            db::MediaKind::Series => db::MediaKind::Season,
+            db::MediaKind::Season => db::MediaKind::Episode,
+            _ => return Ok(0),
+        };
+
+        static TREE_HYDRATION_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
+
+        let _guard = TREE_HYDRATION_LOCKS
+            .lock(parent.id)
+            .await;
+
+        // Re-check only after acquiring the lock: another request may have
+        // completed the same hydration while this request was waiting.
+        //
+        // Do NOT infer completeness from the mere presence of child rows:
+        // a previous multi-chunk hydration may have failed after writing only
+        // part of the level. A hydration-state row is written only after the
+        // whole operation succeeds.
+        //
+        // The marker expires after six hours so continuing shows can discover
+        // new seasons/episodes without background eager expansion.
+        let hydrated_count: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT s.child_count
+            FROM tmaxx_lazy_tree_state s
+            WHERE s.parent_id = ?
+              AND s.child_kind = ?
+              AND s.hydrated_at >= datetime('now', '-6 hours')
+              AND s.child_count = (
+                  SELECT COUNT(*)
+                  FROM media m
+                  WHERE m.parent_id = s.parent_id
+                    AND m.kind = s.child_kind
+              )
+            LIMIT 1
+            "#,
+        )
+        .bind(parent.id)
+        .bind(expected_kind.to_string())
+        .fetch_optional(&ctx.db)
+        .await?;
+
+        if let Some(existing_count) = hydrated_count {
+            trace!(
+                parent_id = %parent.id,
+                parent_kind = %parent.kind,
+                child_kind = %expected_kind,
+                existing_count,
+                "lazy tree hydration skipped; fresh complete level already cached"
+            );
+            return Ok(existing_count as usize);
+        }
+
+        // Episodes need the owning Series metadata as their grandparent
+        // context. Seasons already receive the Series itself as parent.
+        let series = match &parent.kind {
+            db::MediaKind::Series => parent.clone(),
+            db::MediaKind::Season => {
+                let series_id = parent
+                    .parent_id
+                    .or(parent.grandparent_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "season {} has no owning series id",
+                            parent.id
+                        )
+                    })?;
+
+                db::Media::get_by_id(&ctx.db, &series_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "owning series {} for season {} not found",
+                            series_id,
+                            parent.id
+                        )
+                    })?
+            }
+            _ => unreachable!(),
+        };
+
+        // Match the grandparent context used by the existing full-tree
+        // metadata pipeline. Tree addons use these external IDs when deciding
+        // how to resolve Season/Episode nodes.
+        let gp_stub = {
+            let mut gp = db::Media::default();
+            gp.id = series.id;
+            gp.kind = db::MediaKind::Series;
+            gp.title = series.title.clone();
+            gp.external_ids = series
+                .external_ids
+                .clone();
+
+            if let Some(rels) = series
+                .relations
+                .as_ref()
+            {
+                let genre_rels: Vec<(db::MediaRelation, db::Media)> = rels
+                    .iter()
+                    .filter(|(_, m)| m.kind == db::MediaKind::Genre)
+                    .cloned()
+                    .collect();
+
+                if !genre_rels.is_empty() {
+                    gp.relations = Some(genre_rels);
+                }
+            }
+
+            gp
+        };
+
+        // A Season loaded back from SQLite may not have its in-memory
+        // grandparent object populated. Attach the Series stub before asking
+        // the tree addon for its episodes.
+        let mut parent_for_fetch = parent.clone();
+
+        if matches!(
+            parent_for_fetch.kind,
+            db::MediaKind::Season
+        ) {
+            parent_for_fetch.grandparent_id = Some(series.id);
+            parent_for_fetch.grandparent =
+                Some(Box::new(series.clone()));
+        }
+
+        let raw_children = self
+            .get_direct_children(&parent_for_fetch, ctx)
+            .await;
+
+        let raw_children: Vec<db::Media> = raw_children
+            .into_iter()
+            .filter(|child| &child.kind == &expected_kind)
+            .collect();
+
+        if raw_children.is_empty() {
+            debug!(
+                parent_id = %parent.id,
+                parent_title = %parent.title,
+                parent_kind = %parent.kind,
+                child_kind = %expected_kind,
+                "lazy tree hydration returned no direct children"
+            );
+
+            sqlx::query(
+                r#"
+                INSERT INTO tmaxx_lazy_tree_state (
+                    parent_id,
+                    child_kind,
+                    hydrated_at,
+                    child_count
+                )
+                VALUES (?, ?, CURRENT_TIMESTAMP, 0)
+                ON CONFLICT(parent_id, child_kind)
+                DO UPDATE SET
+                    hydrated_at = CURRENT_TIMESTAMP,
+                    child_count = 0
+                "#,
+            )
+            .bind(parent.id)
+            .bind(expected_kind.to_string())
+            .execute(&ctx.db)
+            .await?;
+
+            self.notify_series_done(&series);
+            return Ok(0);
+        }
+
+        // Adopt already-known UUIDs by (kind, index) exactly like the normal
+        // metadata tree processor. Usually empty on the first lazy hydration,
+        // but important for retry/recovery cases.
+        let existing = self
+            .child_uuid_map(&ctx.db, parent.id)
+            .await;
+
+        let config =
+            Arc::new(db::Settings::get_config_or_default(&ctx.db).await);
+
+        let concurrency = config
+            .meta_concurrency
+            .max(1) as usize;
+
+        let semaphore =
+            Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+        let parent_id = parent.id;
+        let series_id = series.id;
+        let is_continuing = series_is_active(&series.status);
+
+        let children: Vec<db::Media> =
+            futures::stream::iter(raw_children)
+                .map(|mut child| {
+                    let svc = self.clone();
+                    let ctx = ctx.clone();
+                    let config = Arc::clone(&config);
+                    let semaphore = Arc::clone(&semaphore);
+                    let gp_stub = gp_stub.clone();
+                    let existing = &existing;
+
+                    async move {
+                        child.parent_id = Some(parent_id);
+                        child.grandparent_id = Some(series_id);
+                        child.grandparent =
+                            Some(Box::new(gp_stub));
+
+                        if let Some(idx) = child.idx {
+                            let key = (
+                                child.kind.to_string(),
+                                idx,
+                            );
+
+                            if let Some(&(
+                                existing_id,
+                                existing_refreshed_at,
+                            )) = existing.get(&key)
+                            {
+                                child.id = existing_id;
+                                child.refreshed_at =
+                                    existing_refreshed_at;
+                            }
+                        }
+
+                        let in_active_window =
+                            is_continuing
+                                && matches!(
+                                    child.kind,
+                                    db::MediaKind::Episode
+                                )
+                                && episode_in_active_window(
+                                    &child
+                                );
+
+                        if let Some(effective_force) =
+                            child_refresh_force(
+                                false,
+                                in_active_window,
+                                &child,
+                            )
+                        {
+                            let _permit = semaphore
+                                .acquire()
+                                .await
+                                .expect(
+                                    "semaphore is never closed"
+                                );
+
+                            if let Err(e) = svc
+                                .refresh_meta(
+                                    &mut child,
+                                    &ctx,
+                                    effective_force,
+                                    &config,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    id = %child.id,
+                                    error = %e,
+                                    "failed to refresh lazy child metadata"
+                                );
+                            }
+                        }
+
+                        child
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+        let mut saved = 0usize;
+
+        for chunk in children.chunks(db::CHUNK_SIZE) {
+            db::Media::upsert(&ctx.db, chunk).await?;
+
+            db::UserMediaState::remap_orphaned_for(
+                &ctx.db,
+                chunk,
+            )
+            .await;
+
+            save_pending_relations(ctx, chunk).await;
+            save_pending_tags(ctx, chunk).await;
+            save_pending_popularity(ctx, chunk).await;
+
+            saved += chunk.len();
+        }
+
+        let persisted_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media WHERE parent_id = ? AND kind = ?",
+        )
+        .bind(parent.id)
+        .bind(expected_kind.to_string())
+        .fetch_one(&ctx.db)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO tmaxx_lazy_tree_state (
+                parent_id,
+                child_kind,
+                hydrated_at,
+                child_count
+            )
+            VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(parent_id, child_kind)
+            DO UPDATE SET
+                hydrated_at = CURRENT_TIMESTAMP,
+                child_count = excluded.child_count
+            "#,
+        )
+        .bind(parent.id)
+        .bind(expected_kind.to_string())
+        .bind(persisted_count)
+        .execute(&ctx.db)
+        .await?;
+
+        self.notify_series_done(&series);
+
+        info!(
+            parent_id = %parent.id,
+            parent_title = %parent.title,
+            parent_kind = %parent.kind,
+            child_kind = %expected_kind,
+            saved,
+            persisted_count,
+            "lazy tree hydration complete"
+        );
+
+        Ok(saved)
+    }
+
     fn notify_series_done(&self, media: &db::Media) {
         if let Some(meta_id) = media
             .external_ids

@@ -439,14 +439,43 @@ impl TreeAddon for StremioAddon {
                     .ok_or_else(|| {
                         anyhow!("season {} has no resolvable meta id", root.id)
                     })?;
-                let meta_arc = self
+                let cached_meta = self
                     .medias_cache
                     .lock()
                     .unwrap()
                     .get(&meta_id)
                     .cloned();
-                let Some(meta_arc) = meta_arc else {
-                    return Ok(None);
+
+                let meta_arc = match cached_meta {
+                    Some(meta_arc) => meta_arc,
+                    None => {
+                        // Lazy-tree requests may arrive long after the Series
+                        // -> Seasons request. The normal full-tree pipeline
+                        // keeps this raw Series meta cached until every Season
+                        // has been processed, but lazy hydration deliberately
+                        // releases that transient cache between requests.
+                        //
+                        // Rehydrate it from the owning Series rather than
+                        // returning an empty Episode list.
+                        let svc = self.service()?;
+                        let series = root
+                            .grandparent
+                            .as_deref()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "season {} missing grandparent for lazy meta fetch",
+                                    root.id
+                                )
+                            })?;
+
+                        fetch_and_cache_meta(
+                            &svc,
+                            series,
+                            &self.medias_cache,
+                            ctx,
+                        )
+                        .await?
+                    }
                 };
                 let season_idx = match root.idx {
                     Some(i) => i,

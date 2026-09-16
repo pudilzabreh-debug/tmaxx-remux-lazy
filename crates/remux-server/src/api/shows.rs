@@ -37,6 +37,12 @@ pub async fn shows_seasons(
     ResolvedItem(item): ResolvedItem,
     Query(mut q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    state
+        .ctx
+        .addons
+        .hydrate_direct_children_for_api(&item, &state.ctx)
+        .await?;
+
     q.parent_id = Some(item.id);
     q.include_item_types = Some(vec![api::MediaType::Season]);
     if q.sort_by
@@ -68,6 +74,21 @@ pub async fn shows_episodes(
     ResolvedItem(item): ResolvedItem,
     Query(mut q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    if let Some(season_id) = q.season_id {
+        if let Some(season) =
+            db::Media::get_by_id(&state.ctx.db, &season_id).await?
+        {
+            state
+                .ctx
+                .addons
+                .hydrate_direct_children_for_api(
+                    &season,
+                    &state.ctx,
+                )
+                .await?;
+        }
+    }
+
     // Some Jellyfin clients accidentally pass the season ID as the show ID in the path.
     // If season_id is given, it's sufficient on its own (maps to parent_id in get_items),
     // so skip setting series_id to avoid filtering by the wrong ID.
