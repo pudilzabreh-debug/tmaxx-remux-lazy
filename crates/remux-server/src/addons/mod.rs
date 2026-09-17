@@ -3574,7 +3574,8 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<()> {
-        const STREAMS_TTL_SECS: i64 = 60;
+        // B4.2A: avoid re-querying remote stream addons on every ODIN revisit.
+        const STREAMS_TTL_SECS: i64 = 300;
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 
         // Fast path: TTL not expired — skip the lock entirely.
@@ -3676,7 +3677,9 @@ impl AddonService {
         let probe_t = std::time::Instant::now();
         let (raw, probe_versions) = tokio::join!(
             self.get_streams(media, ctx, user_id),
-            tokio::time::timeout(std::time::Duration::from_secs(5), probe_versions_fut,)
+            // B4.2A: RemuxDB enrichment is optional. Never let it hold the
+            // foreground stream list for several seconds.
+            tokio::time::timeout(std::time::Duration::from_millis(750), probe_versions_fut,)
         );
         let raw = raw?;
         let probe_versions = match probe_versions {
