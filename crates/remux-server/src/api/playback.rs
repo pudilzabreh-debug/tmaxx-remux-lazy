@@ -148,7 +148,13 @@ async fn items_playbackinfo_inner(
 ) -> Result<impl IntoResponse> {
     let media_source_id = q.media_source_id;
 
-    trace!(?id, ?q, "items_playbackinfo");
+    // B4.2B: Odin asks PlaybackInfo without a MediaSourceId to populate its
+    // stream picker. Do not ffprobe a remote stream until a concrete source
+    // has actually been selected.
+    let fast_selection =
+        session.device.app_name == "Odin" && media_source_id.is_none();
+
+    trace!(?id, ?q, fast_selection, "items_playbackinfo");
 
     let device_profile = q
         .device_profile
@@ -206,6 +212,7 @@ async fn items_playbackinfo_inner(
                 .user
                 .id,
         ),
+        fast_selection,
     });
     let is_live = media.is_live();
     let is_track_item = media.is_track();

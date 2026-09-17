@@ -33,6 +33,9 @@ pub(crate) struct StreamServiceConfig {
     pub show_ungrouped: bool,
     pub stream_filter: Option<StreamFilter>,
     pub user_id: Option<Uuid>,
+    // B4.2B: Odin uses PlaybackInfo without MediaSourceId as a source picker.
+    // That request must not wait for foreground ffprobe of the first source.
+    pub fast_selection: bool,
 }
 
 /// Central service for stream selection on a single playback request.
@@ -47,6 +50,7 @@ pub(crate) struct StreamService {
     show_ungrouped: bool,
     stream_filter: Option<StreamFilter>,
     user_id: Option<Uuid>,
+    fast_selection: bool,
     // Populated by resolve()
     group: Option<(Uuid, String, Vec<db::Media>)>,
     stream: Option<db::Media>,
@@ -62,6 +66,7 @@ impl StreamService {
             show_ungrouped: cfg.show_ungrouped,
             stream_filter: cfg.stream_filter,
             user_id: cfg.user_id,
+            fast_selection: cfg.fast_selection,
             group: None,
             stream: None,
             streams: vec![],
@@ -505,7 +510,11 @@ impl StreamService {
                     si.descriptor
                         .server_input(stream.id, port)
                 });
-            let skip_probe = sel.probe_only_first && idx > 0;
+            // B4.2B: Odin's initial PlaybackInfo request is only building the
+            // source-selection list. Return stored addon metadata immediately.
+            // A concrete MediaSourceId request still follows the normal probe path.
+            let skip_probe = self.fast_selection
+                || (sel.probe_only_first && idx > 0);
             // A filename guess is never a completed probe — it must not skip
             // submitting a freshly-probed result to RemuxDB.
             let was_cached = stream
