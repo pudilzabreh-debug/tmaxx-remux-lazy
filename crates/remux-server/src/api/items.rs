@@ -1580,9 +1580,12 @@ async fn item_for_user(
     fields: Option<&[api::ItemFields]>,
     target_user_id: Option<Uuid>,
 ) -> Result<Option<api::BaseItemDto>> {
+    // B4.1: ordinary item-detail requests must stay metadata-only unless
+    // the client explicitly requests MediaSources. Stream discovery belongs
+    // to PlaybackInfo / explicit MediaSources requests, not basic detail load.
     let want_streams = fields
         .map(|f| f.contains(&api::ItemFields::MediaSources))
-        .unwrap_or(true);
+        .unwrap_or(false);
     let server_config = db::Settings::get_config_or_default(
         &state
             .ctx
