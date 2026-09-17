@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  FROZEN_SHA: 805086e864da505eed2b0df42ad5bd849ef56af8
+  FROZEN_SHA: aebcc9e5a78e0f33db48700f4b3d924de5ea267d
   TARGET: aarch64-unknown-linux-gnu
 
 jobs:
@@ -66,7 +66,7 @@ jobs:
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: tmaxx-remux-arm64-805086e
+          key: tmaxx-remux-arm64-aebcc9e5
 
       - name: Compile remux-server
         shell: bash
@@ -99,7 +99,7 @@ jobs:
       - name: Upload ARM64 server artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tmaxx-remux-server-linux-arm64-805086e
+          name: tmaxx-remux-server-linux-arm64-aebcc9e5
           path: |
             target/aarch64-unknown-linux-gnu/release/remux-server
             remux-server.sha256
